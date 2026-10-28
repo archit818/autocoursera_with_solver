@@ -325,7 +325,10 @@
 
     if (quizToggle) {
         quizToggle.addEventListener('change', () => {
-            chrome.storage.local.set({ quizEnabled: quizToggle.checked });
+            const enabled = quizToggle.checked;
+            chrome.storage.local.set({ quizEnabled: enabled }, () => {
+                showToast(enabled ? '✅ Auto-solve enabled for quiz attempt pages.' : 'Auto-solve disabled.');
+            });
         });
     }
 

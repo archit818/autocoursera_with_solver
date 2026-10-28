@@ -163,15 +163,23 @@
         }
     });
 
+    function onLocationChange() {
+        updateSlug();
+        broadcast('NAVIGATE', {
+            url: window.location.href,
+            pathname: window.location.pathname,
+        });
+    }
+
     for (const methodName of ['pushState', 'replaceState']) {
         const original = history[methodName];
         history[methodName] = function () {
             const result = original.apply(this, arguments);
-            queueMicrotask(updateSlug);
+            queueMicrotask(onLocationChange);
             return result;
         };
     }
-    window.addEventListener('popstate', updateSlug);
+    window.addEventListener('popstate', onLocationChange);
     updateSlug();
     console.log('[AutoCoursera] Page observer v2.2.1 loaded.');
 })();

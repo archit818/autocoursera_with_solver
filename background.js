@@ -1,16 +1,26 @@
 chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
-    if (!tab.url || changeInfo.status !== 'complete') return;
+    const urlString = changeInfo.url || tab?.url;
+    if (!urlString) return;
 
     let url;
-    try { url = new URL(tab.url); } catch (_) { return; }
+    try { url = new URL(urlString); } catch (_) { return; }
     if (!url.hostname.endsWith('coursera.org') || !url.pathname.startsWith('/learn/')) return;
 
-    if (url.pathname.replace(/\/+$/, '').endsWith('/attempt')) {
-        chrome.tabs.sendMessage(tabId, { action: 'attempt' }, function () {
-            if (chrome.runtime.lastError) {
-                console.log('Error sending message to tab:', chrome.runtime.lastError.message);
-            }
-        });
+    const isAttempt = /\/attempt(?:\/|$)/i.test(url.pathname);
+    if (!isAttempt) return;
+
+    // Trigger on SPA pushState URL changes or initial page load complete
+    if (changeInfo.url || changeInfo.status === 'complete') {
+        let retries = 3;
+        function sendAttempt() {
+            chrome.tabs.sendMessage(tabId, { action: 'attempt' }, function () {
+                if (chrome.runtime.lastError && retries > 0) {
+                    retries--;
+                    setTimeout(sendAttempt, 1000);
+                }
+            });
+        }
+        sendAttempt();
     }
 });
 

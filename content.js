@@ -28,6 +28,11 @@
         if (type === 'USER_ID' && payload.userId) state.userId = String(payload.userId);
         if (type === 'SLUG' && payload.slug) syncSlug(String(payload.slug));
         if (type === 'COURSE_ITEMS' && Array.isArray(payload.items)) state.interceptedItems = payload.items;
+        if (type === 'NAVIGATE') {
+            if (typeof checkAndAutoSolve === 'function') {
+                setTimeout(() => checkAndAutoSolve(), 500);
+            }
+        }
         if (type === 'STATE') {
             if (payload.slug) syncSlug(String(payload.slug));
             if (payload.courseId) state.courseId = String(payload.courseId);
@@ -360,11 +365,13 @@
     function findQuestionElements() {
         const selectors = [
             'div[data-testid^="part-Submission_"]',
+            'div[data-testid*="Question"]',
             'div[role="group"][aria-labelledby*="-legend"]',
             '.rc-FormPartsQuestion',
             '[class*="FormPartsQuestion"]',
+            '.rc-Question',
         ];
-        const candidates = [...document.querySelectorAll(selectors.join(', '))].filter(element => {
+        let candidates = [...document.querySelectorAll(selectors.join(', '))].filter(element => {
             const testId = element.getAttribute('data-testid') || '';
             if (/CodeExpression/i.test(testId)) return false;
             return Boolean(element.querySelector(
@@ -372,17 +379,29 @@
             ));
         });
 
+        if (!candidates.length) {
+            const inputs = [...document.querySelectorAll('input[type="radio"], input[type="checkbox"]')];
+            const groups = new Set();
+            for (const input of inputs) {
+                const group = input.closest('fieldset, [role="radiogroup"], [role="group"], [class*="question"], [class*="Question"]') || input.parentElement?.parentElement;
+                if (group) groups.add(group);
+            }
+            candidates = [...groups];
+        }
+
         return candidates.filter(
             element => !candidates.some(other => other !== element && other.contains(element))
         );
     }
 
-    async function waitForQuestionElements(timeoutMs = 8000) {
+    async function waitForQuestionElements(timeoutMs = 15000) {
         const started = Date.now();
         do {
             const elements = findQuestionElements();
             if (elements.length) return elements;
-            await sleep(250);
+            const elapsed = Math.round((Date.now() - started) / 1000);
+            updateOverlay(`Waiting for quiz questions to load... (${elapsed}s)`, 'info');
+            await sleep(300);
         } while (Date.now() - started < timeoutMs);
         return [];
     }
@@ -406,13 +425,12 @@
             );
         const prompt = cleanElementText(promptElement) || `Question ${index + 1}`;
 
-        let optionElements = [...element.querySelectorAll('.rc-Option')].filter(option =>
+        let optionElements = [...element.querySelectorAll('.rc-Option, [class*="Option"], label')].filter(option =>
             option.querySelector('input[type="radio"], input[type="checkbox"]')
         );
         if (!optionElements.length) {
-            optionElements = [...element.querySelectorAll('label')].filter(label =>
-                label.querySelector('input[type="radio"], input[type="checkbox"]')
-            );
+            const rawInputs = [...element.querySelectorAll('input[type="radio"], input[type="checkbox"]')];
+            optionElements = rawInputs.map(input => input.closest('label') || input.parentElement || input);
         }
 
         const inputs = optionElements.map(option =>
@@ -485,15 +503,15 @@
 
     async function solveCurrentPageQuiz() {
         const settings = await getStoredSettings();
+        showOverlay();
         if (!settings.apiKey) {
             updateOverlay('Enter your Gemini API key in the extension settings.', 'warning');
             return false;
         }
 
-        showOverlay();
         setStopButton(false);
         updateOverlay('Reading quiz questions...', 'info');
-        const questionElements = await waitForQuestionElements();
+        const questionElements = await waitForQuestionElements(15000);
         const extracted = questionElements.map(extractQuestion).filter(Boolean);
         if (!extracted.length) {
             updateOverlay('No supported quiz questions were found on this page.', 'warning');
@@ -502,7 +520,7 @@
 
         const questions = extracted.map(item => item.question);
 
-        updateOverlay(`Asking Gemini about ${questions.length} question${questions.length === 1 ? '' : 's'}...`, 'info');
+        updateOverlay(`Asking Gemini (${settings.model || 'Gemini'}) about ${questions.length} question${questions.length === 1 ? '' : 's'}...`, 'info');
         let answers;
         try {
             answers = await new window.GeminiAI(settings.apiKey, settings.model).solveQuestions(JSON.stringify(questions));
@@ -534,10 +552,33 @@
         }
 
         await sleep(500);
+
+        // Check acknowledgment / honor code checkbox if present
+        const ack = document.querySelector(
+            '[data-testid="acknowledgment-checkpoint"] input[type="checkbox"], ' +
+            'input[name*="honorCode"], input[name*="agreement"], ' +
+            '.rc-HonorCodeCheckbox input[type="checkbox"], ' +
+            'label[class*="acknowledgment"] input[type="checkbox"]'
+        );
+        if (ack && !ack.checked) {
+            ack.click();
+            ack.dispatchEvent(new Event('change', { bubbles: true }));
+            await sleep(300);
+        }
+
         const submit = findQuizSubmitButton();
         if (!selectionFailures && submit && !submit.disabled) {
             submit.click();
-            updateOverlay('Answers filled and submitted.', 'success');
+            await sleep(500);
+            // Handle optional confirmation dialog (e.g. "Submit Quiz" in a modal)
+            const confirmBtn = document.querySelector(
+                'div[role="dialog"] button[data-testid="submit-button"], ' +
+                'div[role="dialog"] button.rc-ModalSubmitButton'
+            );
+            if (confirmBtn && !confirmBtn.disabled) {
+                confirmBtn.click();
+            }
+            updateOverlay('Answers filled and submitted! 🎉', 'success');
             return true;
         }
         updateOverlay(
@@ -687,9 +728,39 @@
             chrome.storage.local.get(['apiKey', 'model', 'quizEnabled'], result => resolve({
                 apiKey: result.apiKey || '',
                 model: result.model || 'gemini-2.5-flash',
-                quizEnabled: result.quizEnabled === true,
+                quizEnabled: result.quizEnabled === true || result.quizEnabled === 'true',
             }));
         });
+    }
+
+    let isAutoSolving = false;
+    let lastSolvedUrl = '';
+
+    function isAttemptPage() {
+        const path = window.location.pathname.toLowerCase();
+        if (/\/attempt(?:\/|$)/.test(path)) return true;
+        if (/\/(?:exam|quiz|assignment-submission)\//.test(path) && findQuestionElements().length > 0) return true;
+        return false;
+    }
+
+    async function checkAndAutoSolve(forced = false) {
+        if (!isAttemptPage()) return;
+        const currentUrl = window.location.href.split('#')[0].split('?')[0];
+        if (!forced && (isAutoSolving || lastSolvedUrl === currentUrl)) return;
+
+        const settings = await getStoredSettings();
+        if (!settings.quizEnabled || !settings.apiKey) return;
+
+        isAutoSolving = true;
+        lastSolvedUrl = currentUrl;
+        console.log('[AutoCoursera] Auto-solve starting for:', currentUrl);
+        try {
+            await solveCurrentPageQuiz();
+        } catch (err) {
+            console.error('[AutoCoursera] Auto-solve error:', err);
+        } finally {
+            isAutoSolving = false;
+        }
     }
 
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -704,9 +775,7 @@
             return true;
         }
         if (action === 'attempt') {
-            getStoredSettings().then(settings => {
-                if (settings.quizEnabled && settings.apiKey) solveCurrentPageQuiz();
-            });
+            checkAndAutoSolve(true);
             sendResponse({ ok: true });
             return false;
         }
@@ -721,5 +790,24 @@
 
     setTimeout(requestInterceptorState, 300);
     setTimeout(requestInterceptorState, 1500);
+
+    // Initial check on load
+    setTimeout(() => checkAndAutoSolve(), 600);
+    setTimeout(() => checkAndAutoSolve(), 2500);
+
+    // Watch for SPA URL changes
+    window.addEventListener('popstate', () => setTimeout(() => checkAndAutoSolve(), 500));
+    window.addEventListener('hashchange', () => setTimeout(() => checkAndAutoSolve(), 500));
+
+    let lastKnownUrl = window.location.href;
+    setInterval(() => {
+        if (window.location.href !== lastKnownUrl) {
+            lastKnownUrl = window.location.href;
+            if (isAttemptPage()) {
+                setTimeout(() => checkAndAutoSolve(), 500);
+            }
+        }
+    }, 1000);
+
     console.log('[AutoCoursera] Content script v2.2.1 loaded.');
 })();
